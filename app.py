@@ -14,9 +14,221 @@ FIXES & NEW FEATURES:
 """
 
 import streamlit as st
-import os, re, json, subprocess, tempfile, time, base64
+import os, re, json, subprocess, tempfile, time, base64, sqlite3
 from pathlib import Path
 from datetime import datetime
+
+# Load .env from same directory as app.py
+def _load_env():
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+_load_env()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Meeting History (SQLite)
+# ──────────────────────────────────────────────────────────────────────────────
+_DB = Path(__file__).parent / "meeting_history.db"
+
+def _init_db():
+    con = sqlite3.connect(_DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS meetings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        saved_at TEXT, filename TEXT, duration_secs REAL,
+        speakers TEXT, overall_summary TEXT, action_items TEXT,
+        health_score TEXT, transcript_json TEXT
+    )""")
+    con.commit(); con.close()
+
+def save_meeting(filename, duration, speakers, summary, actions, health, transcripts):
+    _init_db()
+    con = sqlite3.connect(_DB)
+    con.execute(
+        "INSERT INTO meetings (saved_at,filename,duration_secs,speakers,"
+        "overall_summary,action_items,health_score,transcript_json) VALUES (?,?,?,?,?,?,?,?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M"), filename, duration,
+         ", ".join(speakers), summary[:800], actions[:600], health,
+         json.dumps(transcripts[:30]))
+    )
+    con.commit(); con.close()
+
+def load_history(limit=10):
+    _init_db()
+    con = sqlite3.connect(_DB)
+    rows = con.execute(
+        "SELECT id,saved_at,filename,speakers,health_score,overall_summary "
+        "FROM meetings ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    con.close()
+    return rows
+
+def delete_meeting(mid):
+    con = sqlite3.connect(_DB)
+    con.execute("DELETE FROM meetings WHERE id=?", (mid,))
+    con.commit(); con.close()
+
+def search_meetings(query: str):
+    _init_db()
+    con = sqlite3.connect(_DB)
+    q = f"%{query}%"
+    rows = con.execute(
+        "SELECT id,saved_at,filename,speakers,health_score,overall_summary "
+        "FROM meetings WHERE speakers LIKE ? OR overall_summary LIKE ? "
+        "OR action_items LIKE ? OR filename LIKE ? ORDER BY id DESC LIMIT 20",
+        (q, q, q, q)
+    ).fetchall()
+    con.close()
+    return rows
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PDF / DOCX Export
+# ──────────────────────────────────────────────────────────────────────────────
+def export_pdf(title, summary, mom, actions, health, speakers):
+    try:
+        from fpdf import FPDF
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.set_text_color(0, 100, 180)
+        pdf.cell(0, 12, "MeetingMind AI — Report", ln=True)
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(0, 10, title[:80], ln=True)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(100, 100, 100)
+        pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}  |  Health: {health}/100  |  Speakers: {speakers}", ln=True)
+        pdf.ln(4)
+
+        def section(heading, body):
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.set_text_color(0, 100, 180)
+            pdf.cell(0, 9, heading, ln=True)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.set_text_color(30, 30, 30)
+            clean = re.sub(r"\*\*([^*]+)\*\*", r"\1", body or "")
+            clean = re.sub(r"[^\x00-\x7F]", "", clean)
+            pdf.multi_cell(0, 6, clean[:3000])
+            pdf.ln(3)
+
+        section("Executive Summary", summary)
+        section("Minutes of Meeting (MOM)", mom)
+        section("Action Items", actions)
+        import io
+        buf = io.BytesIO(pdf.output())
+        return buf.getvalue()
+    except Exception as e:
+        return None
+
+def export_docx(title, summary, mom, actions, health, speakers, transcripts):
+    try:
+        from docx import Document
+        from docx.shared import Pt, RGBColor
+        import io
+        doc = Document()
+        doc.core_properties.title = title
+        h = doc.add_heading("MeetingMind AI — Meeting Report", 0)
+        h.runs[0].font.color.rgb = RGBColor(0, 100, 180)
+        doc.add_heading(title[:80], level=1)
+        doc.add_paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}")
+        doc.add_paragraph(f"Health Score: {health}/100  |  Speakers: {speakers}")
+        doc.add_paragraph("")
+
+        def add_section(heading, body):
+            doc.add_heading(heading, level=2)
+            clean = re.sub(r"\*\*([^*]+)\*\*", r"\1", body or "")
+            doc.add_paragraph(clean[:3000])
+
+        add_section("Executive Summary", summary)
+        add_section("Minutes of Meeting", mom)
+        add_section("Action Items", actions)
+        if transcripts:
+            doc.add_heading("Transcript", level=2)
+            for t in transcripts[:50]:
+                p = doc.add_paragraph()
+                r = p.add_run(f"[{t.get('display_name', t.get('speaker',''))}]  ")
+                r.bold = True
+                r.font.color.rgb = RGBColor(0, 100, 180)
+                p.add_run(t.get("text",""))
+        buf = io.BytesIO()
+        doc.save(buf)
+        return buf.getvalue()
+    except Exception as e:
+        return None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth helpers
+# ──────────────────────────────────────────────────────────────────────────────
+_USERS_FILE = Path(__file__).parent / "users.json"
+
+def _load_users():
+    if _USERS_FILE.exists():
+        return json.loads(_USERS_FILE.read_text())
+    default = {"admin": {"name": "Admin", "password": "admin123", "role": "admin"}}
+    _USERS_FILE.write_text(json.dumps(default, indent=2))
+    return default
+
+def _check_login(username, password):
+    users = _load_users()
+    u = users.get(username)
+    if not u: return False
+    try:
+        import bcrypt
+        return bcrypt.checkpw(password.encode(), u["password"].encode())
+    except Exception:
+        return u.get("password") == password
+
+def _hash_password(pw):
+    try:
+        import bcrypt
+        return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+    except Exception:
+        return pw
+
+def _add_user(username, name, password, role="user"):
+    users = _load_users()
+    users[username] = {"name": name, "password": _hash_password(password), "role": role}
+    _USERS_FILE.write_text(json.dumps(users, indent=2))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Slack webhook
+# ──────────────────────────────────────────────────────────────────────────────
+def send_slack(webhook_url: str, title: str, summary: str, actions: str, health: str):
+    if not webhook_url:
+        return False
+    try:
+        import urllib.request, urllib.parse
+        payload = json.dumps({
+            "blocks": [
+                {"type":"header","text":{"type":"plain_text","text":f"📋 {title[:75]}"}},
+                {"type":"section","text":{"type":"mrkdwn","text":f"*Health Score:* {health}/100\n\n{summary[:600]}"}},
+                {"type":"divider"},
+                {"type":"section","text":{"type":"mrkdwn","text":f"*🎯 Action Items:*\n{actions[:500]}"}},
+                {"type":"context","elements":[{"type":"mrkdwn","text":f"_Sent by MeetingMind AI · {datetime.now().strftime('%b %d %Y %H:%M')}_"}]}
+            ]
+        }).encode()
+        req = urllib.request.Request(webhook_url, data=payload,
+                                     headers={"Content-Type":"application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception:
+        return False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM retry wrapper
+# ──────────────────────────────────────────────────────────────────────────────
+def call_llm_with_retry(prompt, cfg, max_tokens=1200, retries=3):
+    for attempt in range(retries):
+        result = call_llm(prompt, cfg, max_tokens)
+        if not result.startswith("[LLM unavailable"):
+            return result
+        if attempt < retries - 1:
+            time.sleep(2 ** attempt)
+    return result
 
 st.set_page_config(
     page_title="MeetingMind AI",
@@ -127,6 +339,36 @@ div[data-testid="stFileUploadDropzone"]{background:var(--card)!important;border:
 .stSelectbox>div,.stTextInput>div>div{background:var(--card)!important;}
 </style>
 """, unsafe_allow_html=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth gate
+# ──────────────────────────────────────────────────────────────────────────────
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+    st.session_state.auth_username = ""
+
+if not st.session_state.authenticated:
+    st.markdown('<div class="hero-title">MeetingMind AI</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-sub">Sign in to continue</div>', unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+    users_data = _load_users()
+    _col1, _col2, _col3 = st.columns([1,1.2,1])
+    with _col2:
+        _user = st.text_input("Username", key="_login_user")
+        _pw   = st.text_input("Password", type="password", key="_login_pw")
+        if st.button("Sign In", key="_login_btn"):
+            if _check_login(_user, _pw):
+                st.session_state.authenticated = True
+                st.session_state.auth_username = _user
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+        st.markdown(
+            '<div style="font-size:0.7rem;color:#64748b;text-align:center;margin-top:1rem;">'
+            'Default: admin / admin123 — change after first login</div>',
+            unsafe_allow_html=True
+        )
+    st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -387,6 +629,28 @@ def resolve_speaker_name(label, detected, fallback_idx):
     return f"Participant {fallback_idx+1}", False
 
 # ──────────────────────────────────────────────────────────────────────────────
+# LLM speaker attribution
+# ──────────────────────────────────────────────────────────────────────────────
+def llm_assign_speakers(chunks, cfg):
+    chunks_text = "\n".join(f"[{c['chunk_id']}] {c['text']}" for c in chunks)
+    prompt = (
+        "Below are numbered chunks from a meeting transcript. "
+        "Identify who is speaking in each chunk.\n"
+        "Look for: people being addressed by name, question-answer patterns, "
+        "who introduces topics vs who responds, first-person vs third-person references.\n\n"
+        "Return ONLY a valid JSON array with no markdown or explanation:\n"
+        '[{"chunk_id": 0, "speaker": "Name"}, ...]\n\n'
+        f"Chunks:\n{chunks_text}"
+    )
+    try:
+        import json as _json
+        resp = call_llm(prompt, cfg, max_tokens=2000)
+        resp = re.sub(r"```[a-z]*", "", resp).strip().strip("`").strip()
+        return _json.loads(resp)
+    except Exception:
+        return None
+
+# ──────────────────────────────────────────────────────────────────────────────
 # LLM helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def call_llm(prompt: str, cfg: dict, max_tokens: int = 1200) -> str:
@@ -395,24 +659,18 @@ def call_llm(prompt: str, cfg: dict, max_tokens: int = 1200) -> str:
         try:
             from groq import Groq
             r = Groq(api_key=groq_key).chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="llama-3.3-70b-versatile",
                 messages=[{"role":"user","content":prompt}],
                 max_tokens=max_tokens,
                 temperature=0.3,
             )
             return r.choices[0].message.content.strip()
         except Exception as e:
-            st.warning(f"Groq: {e}")
-    try:
-        import requests
-        r = requests.post(
-            "http://localhost:11434/api/generate",
-            json={"model":"llama3.1","prompt":prompt,"stream":False},
-            timeout=120
-        )
-        return r.json()["response"].strip()
-    except Exception as e:
-        return f"[LLM unavailable: {e}]"
+            st.warning(f"Groq API error: {e}")
+            return f"[LLM unavailable: Groq error – {e}]"
+    if not groq_key:
+        return "[LLM unavailable: No Groq API key configured. Please add your key in the sidebar.]"
+    return "[LLM unavailable: unknown error]"
 
 def translate_to_language(text: str, lang_name: str, cfg: dict) -> str:
     """Translate text to the given language using LLM. Returns translated text."""
@@ -486,12 +744,54 @@ with st.sidebar:
     st.markdown('<div class="hero-sub">Gen AI · v4 · Multilingual</div>', unsafe_allow_html=True)
     st.markdown("---")
 
+    # ── Active file indicator ──────────────────────────────────────────────────
+    _vpath = st.session_state.get("video_path")
+    if _vpath:
+        _fname = Path(_vpath).name
+        _stage = st.session_state.get("stage","upload")
+        _stage_labels = {
+            "upload":"Uploaded","diarize":"Processing","human_loop":"Speaker Review",
+            "summarize":"Analysing","output":"Done ✓"
+        }
+        _stage_text = _stage_labels.get(_stage, _stage.capitalize())
+        st.markdown(
+            f'<div style="background:rgba(0,229,255,0.07);border:1px solid rgba(0,229,255,0.3);'
+            f'border-radius:10px;padding:0.7rem 0.9rem;margin-bottom:0.5rem;">'
+            f'<div style="font-size:0.6rem;color:#00e5ff;letter-spacing:2px;text-transform:uppercase;'
+            f'font-family:JetBrains Mono,monospace;margin-bottom:3px;">📂 Current File</div>'
+            f'<div style="font-size:0.85rem;font-weight:600;color:#e2e8f0;word-break:break-all;">'
+            f'{_fname}</div>'
+            f'<div style="font-size:0.7rem;color:#64748b;margin-top:3px;">Status: {_stage_text}</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            '<div style="background:rgba(100,116,139,0.08);border:1px solid rgba(100,116,139,0.2);'
+            'border-radius:10px;padding:0.7rem 0.9rem;margin-bottom:0.5rem;">'
+            '<div style="font-size:0.6rem;color:#64748b;letter-spacing:2px;text-transform:uppercase;'
+            'font-family:JetBrains Mono,monospace;margin-bottom:3px;">📂 Current File</div>'
+            '<div style="font-size:0.8rem;color:#64748b;">No file loaded</div>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+    st.markdown("---")
+
     st.markdown("**⚙️ Configuration**")
     hf_token      = st.text_input("HuggingFace Token", type="password",
-                                   help="Required for PyAnnote diarization")
+                                   value=os.environ.get("HF_TOKEN",""),
+                                   help="For PyAnnote diarization (optional)")
     groq_key      = st.text_input("Groq API Key", type="password",
+                                   value=os.environ.get("GROQ_API_KEY",""),
                                    help="Free at console.groq.com")
-    whisper_model = st.selectbox("Whisper Model", ["large-v3","medium","small","base"])
+    if groq_key and groq_key != os.environ.get("GROQ_API_KEY",""):
+        env_path = Path(__file__).parent / ".env"
+        lines = env_path.read_text().splitlines() if env_path.exists() else []
+        new_lines = [l for l in lines if not l.startswith("GROQ_API_KEY=")]
+        new_lines.append(f"GROQ_API_KEY={groq_key}")
+        env_path.write_text("\n".join(new_lines) + "\n")
+        os.environ["GROQ_API_KEY"] = groq_key
+    whisper_model = st.selectbox("Whisper Model", ["small","medium","large-v3","base"])
     use_gpu       = st.checkbox("Use GPU (CUDA)", value=False)
 
     st.markdown("---")
@@ -509,6 +809,49 @@ with st.sidebar:
         f'📝 Hindi summary always included</div>',
         unsafe_allow_html=True
     )
+
+    st.markdown("---")
+    st.markdown("**🔍 Search History**")
+    search_q = st.text_input("Search meetings", placeholder="speaker name, topic…", label_visibility="collapsed", key="search_q")
+    if search_q:
+        results = search_meetings(search_q.strip())
+        if results:
+            for row in results:
+                mid, saved_at, fname, speakers, health, summary = row
+                with st.expander(f"📁 {fname[:24]} · {saved_at}"):
+                    st.markdown(f"**Speakers:** {speakers}")
+                    st.markdown(f"**Health:** {health}/100")
+                    st.markdown(f"{summary[:180]}…")
+                    if st.button("🗑 Delete", key=f"sdel_{mid}"):
+                        delete_meeting(mid)
+                        st.rerun()
+        else:
+            st.caption("No results found.")
+
+    st.markdown("---")
+    st.markdown("**🕘 Meeting History**")
+    history = load_history(8)
+    if history:
+        for row in history:
+            mid, saved_at, fname, speakers, health, summary = row
+            with st.expander(f"📁 {fname[:28]} · {saved_at}"):
+                st.markdown(f"**Speakers:** {speakers}")
+                st.markdown(f"**Health:** {health}/100")
+                st.markdown(f"**Summary:** {summary[:200]}...")
+                if st.button("🗑 Delete", key=f"del_{mid}"):
+                    delete_meeting(mid)
+                    st.rerun()
+    else:
+        st.caption("No past meetings saved yet.")
+
+    st.markdown("---")
+    st.markdown("**🔔 Slack Notifications**")
+    slack_url = st.text_input("Slack Webhook URL", type="password",
+                               value=os.environ.get("SLACK_WEBHOOK",""),
+                               help="Paste your Slack Incoming Webhook URL to send MOM after analysis",
+                               key="slack_url")
+    if slack_url:
+        os.environ["SLACK_WEBHOOK"] = slack_url
 
     st.markdown("---")
     st.markdown("**📊 Pipeline**")
@@ -565,7 +908,7 @@ if st.session_state.stage == "upload":
         unsafe_allow_html=True
     )
 
-    uploaded = st.file_uploader("", type=["mp4","mkv","mov","avi","webm"],
+    uploaded = st.file_uploader("Upload Meeting Video", type=["mp4","mkv","mov","avi","webm"],
                                   label_visibility="collapsed")
     if uploaded:
         tmp = tempfile.mkdtemp()
@@ -606,8 +949,8 @@ if st.session_state.stage == "upload":
             }
 
         if st.button("🚀 START ANALYSIS"):
-            if not hf_token:
-                st.markdown('<div class="warning-box">⚠️ HuggingFace token required.</div>',
+            if not groq_key:
+                st.markdown('<div class="warning-box">⚠️ Groq API key required for AI summaries. Get one free at console.groq.com</div>',
                             unsafe_allow_html=True)
             else:
                 st.session_state.stage = "diarize"
@@ -644,28 +987,12 @@ elif st.session_state.stage == "diarize":
         st.error(f"FFmpeg: {e}"); st.stop()
 
     # 2. Diarization
-    status.markdown("**[2/4]** Speaker diarization (PyAnnote)...")
+    status.markdown("**[2/4]** Speaker attribution via LLM...")
     progress.progress(35)
-    try:
-        from pyannote.audio import Pipeline
-        import torch
-        device = "cuda" if cfg.get("use_gpu") and torch.cuda.is_available() else "cpu"
-        pipe = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=cfg["hf_token"]
-        )
-        pipe.to(torch.device(device))
-        dia = pipe(audio_path, max_speakers=cfg.get("max_speakers",5))
-        segments = [{"start":round(t.start,2),"end":round(t.end,2),"speaker":s}
-                    for t,_,s in dia.itertracks(yield_label=True)]
-        st.session_state.diarization = segments
-        n_spk = len(set(s["speaker"] for s in segments))
-        status.markdown(f"**[2/4]** ✓ {n_spk} speakers found")
-        progress.progress(55)
-    except ImportError:
-        st.error("pip install pyannote.audio"); st.stop()
-    except Exception as e:
-        st.error(f"Diarization: {e}"); st.stop()
+    segments = [{"start": 0.0, "end": 86400.0, "speaker": "SPEAKER_00"}]
+    st.session_state.diarization = segments
+    status.markdown("**[2/4]** ✓ LLM speaker attribution active")
+    progress.progress(55)
 
     # Name resolution
     unique_speakers = sorted(set(s["speaker"] for s in segments))
@@ -698,37 +1025,53 @@ elif st.session_state.stage == "diarize":
                     type('W',(object,),{'start':chunk.start,'end':chunk.end,'word':chunk.text})()
                 )
 
-        def best_spk(ws, we, segs):
-            b, mo = "Unknown", 0
-            for seg in segs:
-                ov = max(0, min(we,seg['end'])-max(ws,seg['start']))
-                if ov > mo: mo,b = ov,seg['speaker']
-            return b
-
-        transcribed = []; cur_spk=None; cur_txt=[]; cur_s=cur_e=0
+        # Group words into utterance chunks by silence gaps (>0.5s)
+        word_chunks = []
+        cur_wc = []
         for w in all_words:
-            ws = best_spk(w.start, w.end, segments)
-            if ws == "Unknown": continue
-            if cur_spk is None: cur_spk=ws; cur_s=w.start
-            if ws != cur_spk:
-                if cur_txt:
-                    transcribed.append({
-                        "start":cur_s,"end":cur_e,"speaker":cur_spk,
-                        "original_speaker":cur_spk,
-                        "display_name":spk_display.get(cur_spk,cur_spk),
-                        "text":"".join(cur_txt).strip()
-                    })
-                cur_spk=ws; cur_s=w.start; cur_txt=[w.word]
+            if cur_wc and w.start - cur_wc[-1].end > 0.5:
+                word_chunks.append({
+                    "chunk_id": len(word_chunks),
+                    "start": cur_wc[0].start, "end": cur_wc[-1].end,
+                    "text": "".join(cw.word for cw in cur_wc).strip()
+                })
+                cur_wc = [w]
             else:
-                cur_txt.append(w.word)
-            cur_e = w.end
-        if cur_txt:
-            transcribed.append({
-                "start":cur_s,"end":cur_e,"speaker":cur_spk,
-                "original_speaker":cur_spk,
-                "display_name":spk_display.get(cur_spk,cur_spk),
-                "text":"".join(cur_txt).strip()
+                cur_wc.append(w)
+        if cur_wc:
+            word_chunks.append({
+                "chunk_id": len(word_chunks),
+                "start": cur_wc[0].start, "end": cur_wc[-1].end,
+                "text": "".join(cw.word for cw in cur_wc).strip()
             })
+
+        # Use Groq to assign speaker names from transcript context
+        status.markdown("**[3/4]** Identifying speakers via AI...")
+        speaker_map = {}
+        if cfg.get("groq_key") and word_chunks:
+            assignments = llm_assign_speakers(word_chunks, cfg)
+            if assignments:
+                speaker_map = {a["chunk_id"]: a["speaker"] for a in assignments
+                               if "chunk_id" in a and "speaker" in a}
+
+        # Build transcribed utterances from chunks
+        transcribed = []
+        for wc in word_chunks:
+            spk_name = speaker_map.get(wc["chunk_id"], "Participant 1")
+            spk_key  = spk_name.upper().replace(" ", "_")
+            if transcribed and transcribed[-1]["speaker"] == spk_key:
+                transcribed[-1]["text"] += " " + wc["text"]
+                transcribed[-1]["end"]   = wc["end"]
+            else:
+                transcribed.append({
+                    "start": wc["start"], "end": wc["end"],
+                    "speaker": spk_key, "original_speaker": spk_key,
+                    "display_name": spk_name, "text": wc["text"]
+                })
+
+        # Update unique_speakers and display names from LLM results
+        unique_speakers = sorted(set(t["speaker"] for t in transcribed))
+        spk_display = {t["speaker"]: t["display_name"] for t in transcribed}
 
         st.session_state.transcripts   = transcribed
         st.session_state.speaker_names = {l:spk_display[l] for l in unique_speakers}
@@ -836,33 +1179,44 @@ elif st.session_state.stage == "summarize":
 
     # ── [1] Speaker profiles (English first) ─────────────────────────────────
     status.markdown("**[1/10]** Speaker profiles (English)..."); progress.progress(10)
-    speaker_summaries_en = {}; speaker_action_items = {}
+    speaker_summaries_en = {}; speaker_action_items = {}; speaker_sentiment = {}
     for name in spk_utterances:
-        r = call_llm(
+        r = call_llm_with_retry(
             f"Meeting analyst. Participant: {name}\n"
             f"Write 3-5 sentences about their contribution.\n"
             f"List their Action Items (bullet points or 'None').\n"
-            f"State their emotional tone (1-2 words).\n\n"
+            f"State their emotional tone (1-2 words).\n"
+            f"Rate their sentiment as Positive, Neutral, or Negative with a % confidence.\n\n"
             f"Format EXACTLY:\n"
             f"**Summary:** [text]\n\n"
             f"**Action Items:**\n[list or None]\n\n"
             f"**Tone:** [word]\n\n"
+            f"**Sentiment:** [Positive/Neutral/Negative] [0-100]%\n\n"
             f"Transcript:\n{full_transcript[:3500]}",
             cfg
         )
+        sentiment = "Neutral"
+        sentiment_pct = 50
         if "**Summary:**" in r and "**Action Items:**" in r:
             sp   = r.split("**Action Items:**")[0].replace("**Summary:**","").strip()
             rest = r.split("**Action Items:**")[1]
-            acts, tone = (rest.split("**Tone:**")+[""])[:2]
-            speaker_summaries_en[name]   = f"**Summary:** {sp}\n\n**Tone:** {tone.strip()}"
-            speaker_action_items[name]   = acts.strip()
+            acts, tone_rest = (rest.split("**Tone:**")+[""])[:2]
+            tone_part, sent_part = (tone_rest.split("**Sentiment:**")+[""])[:2]
+            if sent_part.strip():
+                m = re.search(r"(Positive|Neutral|Negative)\s*(\d+)%?", sent_part, re.I)
+                if m:
+                    sentiment = m.group(1).capitalize()
+                    sentiment_pct = int(m.group(2))
+            speaker_summaries_en[name] = f"**Summary:** {sp}\n\n**Tone:** {tone_part.strip()}"
+            speaker_action_items[name] = acts.strip()
         else:
-            speaker_summaries_en[name]   = r
-            speaker_action_items[name]   = "None identified."
+            speaker_summaries_en[name] = r
+            speaker_action_items[name] = "None identified."
+        speaker_sentiment[name] = {"label": sentiment, "pct": sentiment_pct}
 
     # ── [2] Overall English summary ───────────────────────────────────────────
     status.markdown("**[2/10]** Overall summary (English)..."); progress.progress(20)
-    overall_en = call_llm(
+    overall_en = call_llm_with_retry(
         f"Analyse this meeting transcript and provide:\n"
         f"1. Executive Summary (3-4 sentences)\n"
         f"2. Key Decisions Made\n"
@@ -892,7 +1246,7 @@ elif st.session_state.stage == "summarize":
 
     # ── [5] Health score ──────────────────────────────────────────────────────
     status.markdown("**[5/10]** Meeting health score..."); progress.progress(46)
-    health_en = call_llm(
+    health_en = call_llm_with_retry(
         f"Rate this meeting on 5 criteria (each scored /20 with emoji):\n"
         f"1. ⚖️ Participation Balance\n"
         f"2. 😊 Sentiment / Positivity\n"
@@ -917,7 +1271,7 @@ elif st.session_state.stage == "summarize":
     dur_str     = fmt_time(dur_secs) if dur_secs else "N/A"
     attendees   = ", ".join(spk_utterances.keys())
 
-    mom_en = call_llm(
+    mom_en = call_llm_with_retry(
         f"Generate formal Minutes of Meeting (MOM).\n\n"
         f"**MEETING DETAILS**\n"
         f"Recording Date: {rec_date}\n"
@@ -943,7 +1297,7 @@ elif st.session_state.stage == "summarize":
 
     # ── [7] Email ─────────────────────────────────────────────────────────────
     status.markdown("**[7/10]** Follow-up email..."); progress.progress(62)
-    email_en = call_llm(
+    email_en = call_llm_with_retry(
         f"Write a professional follow-up email covering:\n"
         f"- Thank you note\n- Executive summary\n"
         f"- Action items grouped by person\n- Professional closing\n\n"
@@ -959,7 +1313,7 @@ elif st.session_state.stage == "summarize":
     status.markdown("**[8/10]** Title & calendar dates..."); progress.progress(70)
     transcript_dates = extract_dates_from_transcript(full_transcript, cfg)
 
-    meta_r = call_llm(
+    meta_r = call_llm_with_retry(
         f"From this transcript:\n"
         f"1. Create a catchy Meeting Title (max 6 words)\n"
         f"Format:\n**TITLE:** [title]\n\n"
@@ -1030,6 +1384,7 @@ elif st.session_state.stage == "summarize":
         "hindi_summary":        hindi_summary,
         "speaker_summaries":    speaker_summaries_translated,
         "speaker_action_items": speaker_action_items,
+        "speaker_sentiment":    speaker_sentiment,
         "health_en":            health_en,
         "health_translated":    health_translated,
         "mom":                  mom_translated,
@@ -1051,6 +1406,32 @@ elif st.session_state.stage == "summarize":
         "tts_code":             tts_code,
         "date_info":            date_info,
     }
+    # Save to history
+    try:
+        vfile = Path(st.session_state.video_path).name if st.session_state.video_path else "unknown"
+        dur   = st.session_state.video_date_info.get("duration_secs", 0) if st.session_state.video_date_info else 0
+        save_meeting(
+            filename=vfile, duration=dur,
+            speakers=list(spk_utterances.keys()),
+            summary=overall_en,
+            actions=str(speaker_action_items),
+            health=health_num,
+            transcripts=st.session_state.transcripts or []
+        )
+    except Exception:
+        pass
+
+    # Auto-send Slack notification if webhook configured
+    slack_wh = os.environ.get("SLACK_WEBHOOK","")
+    if slack_wh:
+        try:
+            actions_text = "\n".join(
+                f"• {n}: {a}" for n, a in speaker_action_items.items() if a and a != "None identified."
+            ) or "No action items identified."
+            send_slack(slack_wh, meeting_title, overall_en[:400], actions_text, health_num)
+        except Exception:
+            pass
+
     st.session_state.stage = "output"
     st.rerun()
 
@@ -1129,7 +1510,7 @@ elif st.session_state.stage == "output":
     tabs = st.tabs([
         "📝 Transcript","📊 Analytics","❤️ Health","👤 Profiles",
         "✅ Actions","📋 Summary","🇮🇳 Hindi","📋 MOM",
-        "📅 Calendar","📧 Email","💬 Chat"
+        "📅 Calendar","📧 Email","💬 Chat","📤 Export"
     ])
 
     # ═════════════════════════════════════════════════════
@@ -1464,6 +1845,31 @@ elif st.session_state.stage == "output":
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
+            # Word Cloud
+            st.markdown("#### ☁️ Topic Word Cloud")
+            try:
+                from wordcloud import WordCloud, STOPWORDS
+                import matplotlib.pyplot as plt
+                import io
+                all_text = " ".join(t["text"] for t in transcripts)
+                wc = WordCloud(
+                    width=900, height=380, background_color="#131929",
+                    colormap="cool", stopwords=STOPWORDS,
+                    max_words=120, prefer_horizontal=0.85,
+                    contour_color="#00e5ff", contour_width=1
+                ).generate(all_text)
+                fig_wc, ax_wc = plt.subplots(figsize=(9,3.8))
+                fig_wc.patch.set_facecolor("#131929")
+                ax_wc.imshow(wc, interpolation="bilinear")
+                ax_wc.axis("off")
+                buf = io.BytesIO()
+                fig_wc.savefig(buf, format="png", bbox_inches="tight",
+                               facecolor="#131929", dpi=130)
+                plt.close(fig_wc)
+                st.image(buf.getvalue(), use_container_width=True)
+            except Exception as e:
+                st.info(f"Word cloud unavailable: {e}")
+
     # ═════════════════════════════════════════════════════
     # TAB 2 — Health
     # ═════════════════════════════════════════════════════
@@ -1529,11 +1935,22 @@ elif st.session_state.stage == "output":
             unsafe_allow_html=True
         )
         speaker_tts = summaries.get("speaker_tts",{})
+        sentiments  = summaries.get("speaker_sentiment",{})
+        SENT_COLORS = {"Positive":"#10b981","Neutral":"#f59e0b","Negative":"#ef4444"}
+        SENT_EMOJI  = {"Positive":"😊","Neutral":"😐","Negative":"😟"}
         for i,(name,summary) in enumerate(summaries.get("speaker_summaries",{}).items()):
             color,_ = get_speaker_color(i)
+            sent = sentiments.get(name,{})
+            sent_label = sent.get("label","Neutral")
+            sent_pct   = sent.get("pct",50)
+            sent_color = SENT_COLORS.get(sent_label,"#f59e0b")
+            sent_emoji = SENT_EMOJI.get(sent_label,"😐")
             st.markdown(
                 f'<span class="speaker-chip" style="background:{color}22;color:{color};'
-                f'border:1px solid {color}55;font-size:0.9rem;">{name}</span>',
+                f'border:1px solid {color}55;font-size:0.9rem;">{name}</span>'
+                f'&nbsp;<span style="background:{sent_color}22;color:{sent_color};border:1px solid {sent_color}55;'
+                f'padding:3px 10px;border-radius:12px;font-size:0.78rem;">'
+                f'{sent_emoji} {sent_label} {sent_pct}%</span>',
                 unsafe_allow_html=True
             )
             p = speaker_tts.get(name)
@@ -1541,7 +1958,6 @@ elif st.session_state.stage == "output":
                 st.markdown(f"🔊 **Listen — {name}'s profile ({lang_name}):**")
                 st.audio(p, format="audio/mp3")
             else:
-                # Regenerate
                 rp = make_tts(summary, tts_code)
                 if rp:
                     st.markdown(f"🔊 **Listen — {name}'s profile ({lang_name}):**")
@@ -1781,6 +2197,57 @@ elif st.session_state.stage == "output":
                           else translate_to_language(answer_en, lang_name, cfg))
                 st.session_state.chat_history.append({"role":"assistant","content":answer})
             st.rerun()
+
+    # ── Export tab ────────────────────────────────────────────────────────────
+    with tabs[11]:
+        st.markdown("### 📤 Export Meeting Report")
+        st.markdown("Download the meeting analysis as PDF or DOCX, or send it to Slack.")
+
+        title    = summaries.get("meeting_title", "Meeting Report")
+        summary  = summaries.get("overall_translated", summaries.get("overall_en",""))
+        mom_text = summaries.get("mom","")
+        actions  = summaries.get("action_items","")
+        h_score  = health_num
+        spk_str  = ", ".join(speakers)
+
+        c_pdf, c_docx, c_slack = st.columns(3)
+
+        with c_pdf:
+            st.markdown("**📄 PDF Report**")
+            if st.button("Generate PDF", key="gen_pdf"):
+                with st.spinner("Building PDF…"):
+                    pdf_bytes = export_pdf(title, summary, mom_text, actions, h_score, spk_str)
+                if pdf_bytes:
+                    st.download_button("⬇️ Download PDF", data=pdf_bytes,
+                                       file_name="meeting_report.pdf", mime="application/pdf")
+                else:
+                    st.error("PDF generation failed. Make sure fpdf2 is installed.")
+
+        with c_docx:
+            st.markdown("**📝 Word Document (DOCX)**")
+            if st.button("Generate DOCX", key="gen_docx"):
+                with st.spinner("Building DOCX…"):
+                    docx_bytes = export_docx(title, summary, mom_text, actions, h_score, spk_str, transcripts)
+                if docx_bytes:
+                    st.download_button("⬇️ Download DOCX", data=docx_bytes,
+                                       file_name="meeting_report.docx",
+                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                else:
+                    st.error("DOCX generation failed. Make sure python-docx is installed.")
+
+        with c_slack:
+            st.markdown("**📨 Send to Slack**")
+            webhook = os.environ.get("SLACK_WEBHOOK","") or st.session_state.get("slack_url","")
+            if not webhook:
+                st.info("Add your Slack Webhook URL in the sidebar to enable this.")
+            else:
+                if st.button("Send MOM to Slack", key="send_slack"):
+                    with st.spinner("Sending…"):
+                        ok = send_slack(webhook, title, summary, actions, h_score)
+                    if ok:
+                        st.success("Sent to Slack!")
+                    else:
+                        st.error("Slack send failed. Check your webhook URL.")
 
     # ── Export footer ──────────────────────────────────────────────────────────
     st.markdown("---")
