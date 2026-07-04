@@ -215,7 +215,10 @@ def send_slack(webhook_url: str, title: str, summary: str, actions: str, health:
                                      headers={"Content-Type":"application/json"})
         urllib.request.urlopen(req, timeout=10)
         return True
-    except Exception:
+    except Exception as e:
+        import traceback
+        print("SLACK SEND FAILED:", repr(e))
+        traceback.print_exc()
         return False
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1423,14 +1426,16 @@ elif st.session_state.stage == "summarize":
 
     # Auto-send Slack notification if webhook configured
     slack_wh = os.environ.get("SLACK_WEBHOOK","")
+    print("SLACK_WEBHOOK env value present:", bool(slack_wh))
     if slack_wh:
         try:
             actions_text = "\n".join(
                 f"• {n}: {a}" for n, a in speaker_action_items.items() if a and a != "None identified."
             ) or "No action items identified."
-            send_slack(slack_wh, meeting_title, overall_en[:400], actions_text, health_num)
-        except Exception:
-            pass
+            result = send_slack(slack_wh, meeting_title, overall_en[:400], actions_text, health_num)
+            print("send_slack() returned:", result)
+        except Exception as e:
+            print("AUTO-SEND SLACK BLOCK CRASHED:", repr(e))
 
     st.session_state.stage = "output"
     st.rerun()
