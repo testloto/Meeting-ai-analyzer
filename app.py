@@ -856,6 +856,19 @@ with st.sidebar:
     if slack_url:
         os.environ["SLACK_WEBHOOK"] = slack_url
 
+    if st.button("🧪 Test Slack Webhook Now", key="test_slack_btn"):
+        if not slack_url:
+            st.error("Paste a webhook URL above first.")
+        else:
+            try:
+                ok = send_slack(slack_url, "Test Meeting", "This is a test summary.", "• Test action item", 99)
+                if ok:
+                    st.success("Sent! Check your Slack channel.")
+                else:
+                    st.error("send_slack() returned False — request failed silently (bad URL or network issue).")
+            except Exception as e:
+                st.error(f"Crashed: {e!r}")
+
     st.markdown("---")
     st.markdown("**📊 Pipeline**")
     stages = [
@@ -1424,18 +1437,6 @@ elif st.session_state.stage == "summarize":
     except Exception:
         pass
 
-    # Auto-send Slack notification if webhook configured
-    slack_wh = os.environ.get("SLACK_WEBHOOK","")
-    print("SLACK_WEBHOOK env value present:", bool(slack_wh))
-    if slack_wh:
-        try:
-            actions_text = "\n".join(
-                f"• {n}: {a}" for n, a in speaker_action_items.items() if a and a != "None identified."
-            ) or "No action items identified."
-            result = send_slack(slack_wh, meeting_title, overall_en[:400], actions_text, health_num)
-            print("send_slack() returned:", result)
-        except Exception as e:
-            print("AUTO-SEND SLACK BLOCK CRASHED:", repr(e))
 
     st.session_state.stage = "output"
     st.rerun()
@@ -1474,6 +1475,21 @@ elif st.session_state.stage == "output":
             except Exception:
                 pass
     h_emoji, h_label, h_color = get_health_emoji(health_num)
+
+    # ── Auto-send to Slack once per completed analysis ────────────────────────
+    webhook = os.environ.get("SLACK_WEBHOOK","")
+    if webhook and st.session_state.get("_slack_auto_sent_id") != id(summaries):
+        st.session_state._slack_auto_sent_id = id(summaries)
+        try:
+            speaker_action_items = summaries.get("speaker_action_items", {})
+            actions_text = "\n".join(
+                f"• {n}: {a}" for n, a in speaker_action_items.items() if a and a != "None identified."
+            ) or "No action items identified."
+            summary_text = summaries.get("overall_translated", summaries.get("overall_en",""))
+            if send_slack(webhook, summaries.get("meeting_title","Meeting Report"), summary_text, actions_text, health_num):
+                st.toast("📨 MOM sent to Slack automatically")
+        except Exception:
+            pass
 
     # ── Header + metrics ──────────────────────────────────────────────────────
     st.markdown(
@@ -2211,7 +2227,10 @@ elif st.session_state.stage == "output":
         title    = summaries.get("meeting_title", "Meeting Report")
         summary  = summaries.get("overall_translated", summaries.get("overall_en",""))
         mom_text = summaries.get("mom","")
-        actions  = summaries.get("action_items","")
+        speaker_action_items = summaries.get("speaker_action_items", {})
+        actions  = "\n".join(
+            f"• {n}: {a}" for n, a in speaker_action_items.items() if a and a != "None identified."
+        ) or "No action items identified."
         h_score  = health_num
         spk_str  = ", ".join(speakers)
 

@@ -11,8 +11,12 @@ c:\Users\ChitraSarkar\Downloads\files\venv\Scripts\Activate.ps1
 
 ## ⚡ Quick Start (10 minutes)
 
-token - REDACTED_HF_TOKEN
-groq - REDACTED_GROQ_KEY
+Create a `.env` file in the project root with:
+```
+HF_TOKEN=your_huggingface_token
+GROQ_API_KEY=your_groq_api_key
+SLACK_WEBHOOK=your_slack_webhook_url
+```
 
 ### 1. Prerequisites
 ```bash
