@@ -10,9 +10,6 @@ torch>=2.0.0
 groq>=0.4.0
 requests>=2.31.0
 
-# Translation (Hindi)
-googletrans==4.0.0rc1
-
 # UI
 streamlit>=1.32.0
 
